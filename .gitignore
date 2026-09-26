@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# job data — personal info, never commit
+jobs.json
+uploads/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+*.egg-info/
+
+# mac
+.DS_Store
+
+# logs
+*.log

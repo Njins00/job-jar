@@ -1,4 +1,4 @@
-python-telegram-bot==21.3
+python-telegram-bot==22.8
 flask==3.0.3
 apscheduler==3.10.4
 python-dotenv==1.0.1

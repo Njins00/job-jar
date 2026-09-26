@@ -22,12 +22,11 @@ from telegram.ext import (
 load_dotenv()
 
 # config
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
-ALLOWED_ID   = int(os.getenv("ALLOWED_USER_ID"))
-BOT_API_URL  = os.getenv("BOT_API_URL", "http://localhost:8081/bot")
-DATA_FILE    = os.getenv("DATA_FILE", "jobs.json")
-UPLOAD_DIR   = os.getenv("UPLOAD_DIR", "uploads")
-DASH_PORT    = int(os.getenv("DASHBOARD_PORT", 5000))
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+ALLOWED_ID = int(os.getenv("ALLOWED_USER_ID"))
+DATA_FILE  = os.getenv("DATA_FILE", "jobs.json")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+DASH_PORT  = int(os.getenv("DASHBOARD_PORT", 5000))
 
 # conversation states
 WAIT_RESUME, WAIT_COVER = range(2)
@@ -180,8 +179,6 @@ async def receive_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not job_id:
         return ConversationHandler.END
 
-    resume_path = None
-
     if update.message.document:
         file = await update.message.document.get_file()
         fname = f"{job_id}_resume_{update.message.document.file_name}"
@@ -278,10 +275,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     jobs = load_jobs()
-    total    = len(jobs)
-    pending  = sum(1 for j in jobs.values() if j["status"] == "pending")
-    applied  = sum(1 for j in jobs.values() if j["status"] == "applied")
-    skipped  = sum(1 for j in jobs.values() if j["status"] == "skipped")
+    total   = len(jobs)
+    pending = sum(1 for j in jobs.values() if j["status"] == "pending")
+    applied = sum(1 for j in jobs.values() if j["status"] == "applied")
+    skipped = sum(1 for j in jobs.values() if j["status"] == "skipped")
     await update.message.reply_text(
         f"📊 *Job Stats*\n\n"
         f"Total: {total}\n"
@@ -307,13 +304,8 @@ async def send_reminders(app):
 # --- main ---
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .base_url(BOT_API_URL)
-        .base_file_url(BOT_API_URL.replace("/bot", "/file/bot"))
-        .build()
-    )
+    # uses Telegram's official API — no local bot API server needed
+    app = Application.builder().token(BOT_TOKEN).build()
 
     # conversation for apply flow
     conv = ConversationHandler(

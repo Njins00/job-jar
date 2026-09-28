@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import logging
@@ -6,6 +7,7 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from html.parser import HTMLParser
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
@@ -27,13 +29,44 @@ DATA_FILE  = os.getenv("DATA_FILE", "jobs.json")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 DASH_URL   = os.getenv("DASHBOARD_URL", "http://192.168.2.28:5000")
 
-# conversation states
+MAX_FILE_MB = 10
+
 WAIT_RESUME, WAIT_COVER = range(2)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
+
+
+# --- security helpers ---
+
+def is_safe_url(url: str) -> bool:
+    # only allow public http/https urls, block internal network
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.hostname or ""
+        blocked = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+        if host in blocked:
+            return False
+        if host.startswith(("192.168.", "10.", "172.16.", "172.17.",
+                             "172.18.", "172.19.", "172.20.", "172.21.",
+                             "172.22.", "172.23.", "172.24.", "172.25.",
+                             "172.26.", "172.27.", "172.28.", "172.29.",
+                             "172.30.", "172.31.")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def safe_filename(name: str) -> str:
+    # basename only — strip any path traversal attempts
+    name = Path(name).name
+    name = re.sub(r"[^\w\-.]", "_", name)
+    return name[:100]
 
 
 # --- title scraper ---
@@ -131,7 +164,7 @@ def skipped_kb(url: str) -> InlineKeyboardMarkup:
     ]])
 
 
-# --- message text builders ---
+# --- message text ---
 
 def pending_text(title: str, url: str, reminder: int = 0) -> str:
     badge = f"⏰ Reminder #{reminder} — " if reminder > 0 else ""
@@ -160,10 +193,12 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     url = update.message.text.strip()
 
-    msg = await update.message.reply_text(
-        "🔍 Fetching...",
-        parse_mode="Markdown",
-    )
+    # block internal network URLs
+    if not is_safe_url(url):
+        await update.message.reply_text("⚠️ That URL isn't allowed.")
+        return
+
+    msg = await update.message.reply_text("🔍 Fetching...")
 
     title = fetch_title(url)
     job_id = add_job(url, title, update.effective_chat.id, msg.message_id)
@@ -219,8 +254,13 @@ async def receive_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if update.message.document:
-        file = await update.message.document.get_file()
-        fname = f"{job_id}_resume_{update.message.document.file_name}"
+        doc = update.message.document
+        # file size check
+        if doc.file_size > MAX_FILE_MB * 1024 * 1024:
+            await update.message.reply_text(f"❌ File too large (max {MAX_FILE_MB}MB). Send another or /skip")
+            return WAIT_RESUME
+        file = await doc.get_file()
+        fname = f"{job_id}_resume_{safe_filename(doc.file_name)}"
         path = str(Path(UPLOAD_DIR) / fname)
         await file.download_to_drive(path)
         update_job(job_id, resume=path)
@@ -257,18 +297,19 @@ async def _finish_apply(update, ctx, document):
     job = jobs.get(job_id, {})
 
     if document:
-        file = await document.get_file()
-        fname = f"{job_id}_cover_{document.file_name}"
-        path = str(Path(UPLOAD_DIR) / fname)
-        await file.download_to_drive(path)
-        update_job(job_id, cover_letter=path)
+        if document.file_size > MAX_FILE_MB * 1024 * 1024:
+            await update.message.reply_text(f"❌ File too large (max {MAX_FILE_MB}MB). Skipping cover letter.")
+        else:
+            file = await document.get_file()
+            fname = f"{job_id}_cover_{safe_filename(document.file_name)}"
+            path = str(Path(UPLOAD_DIR) / fname)
+            await file.download_to_drive(path)
+            update_job(job_id, cover_letter=path)
 
     update_job(job_id, status="applied", applied_date=datetime.now().isoformat())
 
-    # clean up the resume/cover prompts
     await update.message.delete()
 
-    # edit the original job message to applied state
     try:
         await ctx.bot.edit_message_text(
             chat_id=job["chat_id"],
@@ -311,7 +352,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --- 12hr reminder — edits original message ---
+# --- 12hr reminder ---
 
 async def send_reminders(app):
     jobs = load_jobs()

@@ -210,6 +210,12 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         link_preview_options=LinkPreviewOptions(url=url),
     )
 
+    # delete user's original message — keep chat to one message per job
+    try:
+        await update.message.delete()
+    except Exception:
+        pass  # fine if can't delete (e.g. forwarded messages)
+
 
 # --- callback handler ---
 

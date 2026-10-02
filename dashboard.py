@@ -1,10 +1,11 @@
 import os
-import json
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
 from dotenv import load_dotenv
 from flask import Flask, render_template_string, send_file, redirect, url_for, request, abort, Response
+
+import store
 
 load_dotenv()
 
@@ -117,6 +118,12 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px; }
 .files { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
 .back { color: var(--muted); font-size: 0.85rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; margin-bottom: 20px; }
 .back:hover { color: var(--text); }
+.job-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.job-row .job-card { flex: 1; margin-bottom: 0; }
+.job-row form { display: flex; }
+.del { background: transparent; color: #ef4444; border: 1px solid #3a1f1f; border-radius: var(--radius); padding: 0 14px; font-size: 0.8rem; cursor: pointer; }
+.del:hover { background: #2a1414; }
+.btn.danger { background: #ef4444; }
 </style>
 </head>
 <body>
@@ -152,6 +159,7 @@ INDEX = BASE.replace("{% block content %}{% endblock %}", """
   <div class="section-header">{{ meta.emoji }} {{ meta.label }}<span class="count">{{ group|length }}</span></div>
   {% if group %}
     {% for job in group %}
+    <div class="job-row">
     <a class="job-card" href="/job/{{ job.id }}">
       <div class="dot" style="background:{{ meta.color }}"></div>
       <div class="body">
@@ -164,6 +172,12 @@ INDEX = BASE.replace("{% block content %}{% endblock %}", """
       </div>
       <div class="arrow">›</div>
     </a>
+    {% if job.status == 'skipped' %}
+    <form method="POST" action="/delete/{{ job.id }}" onsubmit="return confirm('Delete this job for good?');">
+      <button class="del" type="submit">Delete</button>
+    </form>
+    {% endif %}
+    </div>
     {% endfor %}
   {% else %}
     <p class="empty">Nothing here</p>
@@ -216,28 +230,21 @@ DETAIL = BASE.replace("{% block content %}{% endblock %}", """
   <button class="btn" type="submit">Save</button>
 </form>
 <a class="btn secondary" href="{{ job.url }}" target="_blank">🌐 Open Job Listing</a>
+{% if job.status == 'skipped' %}
+<form method="POST" action="/delete/{{ job.id }}" onsubmit="return confirm('Delete this job for good?');" style="margin-top:12px">
+  <button class="btn danger" type="submit">Delete job</button>
+</form>
+{% endif %}
 {% endblock %}
 """)
 
 
 # ------------------------------------------------------------------ helpers
 
-def load_jobs() -> dict:
-    if not Path(DATA_FILE).exists():
-        return {}
-    with open(DATA_FILE) as f:
-        return json.load(f)
-
-
-def save_jobs(jobs: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(jobs, f, indent=2)
-
-
 def safe_send_file(path: str):
-    # prevent path traversal — file must be inside uploads dir
+    # prevent path traversal — ensure file is inside uploads dir
     resolved = Path(path).resolve()
-    if not str(resolved).startswith(str(UPLOAD_PATH)):
+    if not resolved.is_relative_to(UPLOAD_PATH):
         abort(403)
     if not resolved.exists():
         abort(404)
@@ -249,7 +256,7 @@ def safe_send_file(path: str):
 @app.route("/")
 @require_auth
 def index():
-    jobs = load_jobs()
+    jobs = store.load_jobs()
     jobs_by_status = {s: [] for s in ALL_STATUSES}
     counts = {s: 0 for s in ALL_STATUSES}
     for job in jobs.values():
@@ -266,7 +273,7 @@ def index():
 @app.route("/job/<job_id>")
 @require_auth
 def job_detail(job_id):
-    jobs = load_jobs()
+    jobs = store.load_jobs()
     if job_id not in jobs:
         abort(404)
     return render_template_string(DETAIL, job=jobs[job_id], status_meta=STATUS_META)
@@ -278,14 +285,41 @@ def update_status(job_id):
     new_status = request.form.get("status")
     if new_status not in ALL_STATUSES:
         abort(400)
-    jobs = load_jobs()
-    if job_id not in jobs:
+
+    def _set(jobs):
+        if job_id not in jobs:
+            return False
+        jobs[job_id]["status"] = new_status
+        if new_status == "applied" and not jobs[job_id].get("applied_date"):
+            jobs[job_id]["applied_date"] = datetime.now().isoformat()
+        return True
+
+    if not store.update_jobs(_set):
         abort(404)
-    jobs[job_id]["status"] = new_status
-    if new_status == "applied" and not jobs[job_id].get("applied_date"):
-        jobs[job_id]["applied_date"] = datetime.now().isoformat()
-    save_jobs(jobs)
     return redirect(url_for("job_detail", job_id=job_id))
+
+
+@app.route("/delete/<job_id>", methods=["POST"])
+@require_auth
+def delete_job(job_id):
+    # only skipped jobs can go, applied ones keep their paper trail
+    def _pop(jobs):
+        job = jobs.get(job_id)
+        if not job or job.get("status") != "skipped":
+            return None
+        return jobs.pop(job_id)
+
+    job = store.update_jobs(_pop)
+    if job is None:
+        abort(400)
+    # tidy up any files it had, but only inside uploads/
+    for key in ("resume", "cover_letter"):
+        path = job.get(key)
+        if path:
+            p = Path(path).resolve()
+            if p.is_relative_to(UPLOAD_PATH) and p.exists():
+                p.unlink()
+    return redirect(url_for("index"))
 
 
 @app.route("/download/<job_id>/<file_type>")
@@ -293,7 +327,7 @@ def update_status(job_id):
 def download_file(job_id, file_type):
     if file_type not in ("resume", "cover"):
         abort(400)
-    jobs = load_jobs()
+    jobs = store.load_jobs()
     if job_id not in jobs:
         abort(404)
     job = jobs[job_id]

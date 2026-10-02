@@ -3,6 +3,9 @@
 
 # job data — personal info, never commit
 jobs.json
+state.json
+jobs.lock
+.tmp-*.json
 uploads/
 
 # python

@@ -1,7 +1,9 @@
 import os
 import re
 import json
+import html
 import uuid
+import asyncio
 import logging
 import requests
 from datetime import datetime
@@ -11,6 +13,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,13 +33,18 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 DASH_URL   = os.getenv("DASHBOARD_URL", "http://192.168.2.28:5000")
 
 MAX_FILE_MB = 10
+MAX_TITLE   = 200
 
 WAIT_RESUME, WAIT_COVER = range(2)
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request url and those urls carry the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
+
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
 # --- security helpers ---
@@ -69,6 +77,14 @@ def safe_filename(name: str) -> str:
     return name[:100]
 
 
+def extract_url(text: str):
+    # share sheets add text around the link, just grab the url
+    m = URL_RE.search(text or "")
+    if not m:
+        return None
+    return m.group(0).rstrip(".,;:!?)]}")
+
+
 # --- title scraper ---
 
 class TitleParser(HTMLParser):
@@ -95,9 +111,10 @@ def fetch_title(url: str) -> str:
         r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         p = TitleParser()
         p.feed(r.text[:8000])
-        return p.title.strip() or url
+        title = " ".join(p.title.split())
+        return (title or url)[:MAX_TITLE]
     except Exception:
-        return url
+        return url[:MAX_TITLE]
 
 
 # --- storage ---
@@ -164,19 +181,46 @@ def skipped_kb(url: str) -> InlineKeyboardMarkup:
     ]])
 
 
-# --- message text ---
+# --- message text (html, everything from outside gets escaped) ---
+
+def esc(s) -> str:
+    return html.escape(str(s or ""), quote=False)
+
+
+def plain(text: str) -> str:
+    # our html minus the tags, for when telegram still won't take it
+    return html.unescape(re.sub(r"</?b>", "", text))
+
 
 def pending_text(title: str, url: str, reminder: int = 0) -> str:
     badge = f"⏰ Reminder #{reminder} — " if reminder > 0 else ""
-    return f"{badge}💼 *{title}*\n{url}"
+    return f"{badge}💼 <b>{esc(title)}</b>\n{esc(url)}"
 
 
 def applied_text(title: str) -> str:
-    return f"✅ *{title}*"
+    return f"✅ <b>{esc(title)}</b>"
 
 
 def skipped_text(title: str) -> str:
-    return f"❌ *{title}*"
+    return f"❌ <b>{esc(title)}</b>"
+
+
+async def edit_card(bot, chat_id, message_id, text, kb, preview_url=None):
+    # html first, plain text if telegram rejects it — a card should never get stuck
+    opts = LinkPreviewOptions(url=preview_url) if preview_url else None
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text,
+            reply_markup=kb, parse_mode="HTML", link_preview_options=opts,
+        )
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return
+        log.warning(f"html edit failed for message {message_id}, going plain: {e}")
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=plain(text),
+            reply_markup=kb, link_preview_options=opts,
+        )
 
 
 # --- auth ---
@@ -191,24 +235,25 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
 
-    url = update.message.text.strip()
+    url = extract_url(update.message.text)
 
     # block internal network URLs
-    if not is_safe_url(url):
+    if not url or not is_safe_url(url):
         await update.message.reply_text("⚠️ That URL isn't allowed.")
         return
 
     msg = await update.message.reply_text("🔍 Fetching...")
 
-    title = fetch_title(url)
+    # requests blocks, keep it off the event loop
+    title = await asyncio.to_thread(fetch_title, url)
     job_id = add_job(url, title, update.effective_chat.id, msg.message_id)
 
-    await msg.edit_text(
-        pending_text(title, url),
-        reply_markup=pending_kb(job_id, url),
-        parse_mode="Markdown",
-        link_preview_options=LinkPreviewOptions(url=url),
-    )
+    try:
+        await edit_card(ctx.bot, msg.chat_id, msg.message_id,
+                        pending_text(title, url), pending_kb(job_id, url), preview_url=url)
+    except Exception as e:
+        log.warning(f"could not build card for {job_id}: {e}")
+        return  # keep the user's message so the link isn't lost
 
     # delete user's original message — keep chat to one message per job
     try:
@@ -234,17 +279,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "skip":
         update_job(job_id, status="skipped")
-        await query.edit_message_text(
-            skipped_text(job["title"]),
-            reply_markup=skipped_kb(job["url"]),
-            parse_mode="Markdown",
-        )
+        await edit_card(ctx.bot, query.message.chat_id, query.message.message_id,
+                        skipped_text(job["title"]), skipped_kb(job["url"]))
 
     elif action == "applied":
         ctx.user_data["applying_job"] = job_id
         await query.message.reply_text(
-            f"📎 Resume for *{job['title']}*\n\nSend a file or /skip",
-            parse_mode="Markdown",
+            f"📎 Resume for <b>{esc(job['title'])}</b>\n\nSend a file or /skip",
+            parse_mode="HTML",
         )
         return WAIT_RESUME
 
@@ -317,13 +359,8 @@ async def _finish_apply(update, ctx, document):
     await update.message.delete()
 
     try:
-        await ctx.bot.edit_message_text(
-            chat_id=job["chat_id"],
-            message_id=job["message_id"],
-            text=applied_text(job["title"]),
-            reply_markup=done_kb(job_id, job["url"]),
-            parse_mode="Markdown",
-        )
+        await edit_card(ctx.bot, job["chat_id"], job["message_id"],
+                        applied_text(job["title"]), done_kb(job_id, job["url"]))
     except Exception as e:
         log.warning(f"could not edit original message: {e}")
 
@@ -340,8 +377,19 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not pending:
         await update.message.reply_text("No pending jobs 🎉")
         return
-    lines = [f"🟡 *{j['title']}*\n{j['url']}" for j in pending]
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    # stay under telegram's 4096 char limit
+    lines, size = [], 0
+    for j in pending:
+        line = f"🟡 <b>{esc(j['title'])}</b>\n{esc(j['url'])}"
+        if size + len(line) > 3800:
+            lines.append(f"…and {len(pending) - len(lines)} more on the dashboard")
+            break
+        lines.append(line)
+        size += len(line) + 2
+    await update.message.reply_text(
+        "\n\n".join(lines), parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -353,8 +401,8 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     applied = sum(1 for j in jobs.values() if j["status"] == "applied")
     skipped = sum(1 for j in jobs.values() if j["status"] == "skipped")
     await update.message.reply_text(
-        f"📊 *Job Stats*\n\nTotal: {total}\n🟡 Pending: {pending}\n✅ Applied: {applied}\n❌ Skipped: {skipped}",
-        parse_mode="Markdown",
+        f"📊 <b>Job Stats</b>\n\nTotal: {total}\n🟡 Pending: {pending}\n✅ Applied: {applied}\n❌ Skipped: {skipped}",
+        parse_mode="HTML",
     )
 
 
@@ -368,22 +416,30 @@ async def send_reminders(app):
         count = job.get("reminder_count", 0) + 1
         update_job(job["id"], reminder_count=count)
         try:
-            await app.bot.edit_message_text(
-                chat_id=job["chat_id"],
-                message_id=job["message_id"],
-                text=pending_text(job["title"], job["url"], reminder=count),
-                reply_markup=pending_kb(job["id"], job["url"]),
-                parse_mode="Markdown",
-                link_preview_options=LinkPreviewOptions(url=job["url"]),
-            )
+            await edit_card(app.bot, job["chat_id"], job["message_id"],
+                            pending_text(job["title"], job["url"], reminder=count),
+                            pending_kb(job["id"], job["url"]), preview_url=job["url"])
         except Exception as e:
             log.warning(f"reminder edit failed for {job['id']}: {e}")
+
+
+async def resync_cards(app):
+    # redraw pending cards on start, fixes any stuck on "Fetching..."
+    for job in load_jobs().values():
+        if job["status"] != "pending":
+            continue
+        try:
+            await edit_card(app.bot, job["chat_id"], job["message_id"],
+                            pending_text(job["title"], job["url"], job.get("reminder_count", 0)),
+                            pending_kb(job["id"], job["url"]), preview_url=job["url"])
+        except Exception as e:
+            log.warning(f"resync failed for {job['id']}: {e}")
 
 
 # --- main ---
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(resync_cards).build()
 
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_callback, pattern=r"^applied:")],
